@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Copyliquid — Hyperliquid 地址分析 & 跟单回测</title>
+<meta name="description" content="输入任意 Hyperliquid 地址：全周期跟单回测、交易风格画像、标签识别与可跟单判定">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📡</text></svg>">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+<header>
+  <div class="eyebrow">Hyperliquid Copy-Trade Radar</div>
+  <h1>Copyliquid：输入地址，回测 + 画像 + 可跟单判定</h1>
+  <p class="sub">数据全部来自 Hyperliquid 公开 API，在你的浏览器里现场计算，不经过任何服务器。</p>
+  <div class="inputrow">
+    <input id="addr" class="mono" placeholder="0x… 粘贴 Hyperliquid 地址" spellcheck="false">
+    <button id="go">开始分析</button>
+  </div>
+  <div class="examples">示例：<a href="#" class="ex mono">0xa65ce1d604fa901c13aa29f2126a57d9032e412b</a></div>
+</header>
+
+<section id="progress" class="hidden">
+  <div class="panel"><div id="plog" class="plog mono"></div></div>
+</section>
+
+<main id="report" class="hidden">
+  <section id="verdict"></section>
+  <section id="cards"></section>
+  <section id="copysec">
+    <h2>跟单净值曲线（全周期模拟） <span class="tag">follower equity · $100k 起 · hourly</span></h2>
+    <p class="sub" id="copysub"></p>
+    <div class="panel">
+      <div class="legend"><span><i style="background:var(--mint)"></i>跟单净值</span><span><i style="background:#3a5c50;height:8px;opacity:.6"></i>回撤（下轴）</span></div>
+      <canvas id="eqChart" height="380"></canvas>
+    </div>
+  </section>
+  <section id="leadersec">
+    <h2>该地址官方累计 PnL 与权益 <span class="tag">portfolio API</span></h2>
+    <p class="sub">累计已实现+未实现 PnL（官方口径）；权益线含出入金。</p>
+    <div class="panel">
+      <div class="legend"><span><i style="background:var(--mint)"></i>累计 PnL</span><span><i style="background:var(--amber)"></i>账户权益（右轴）</span></div>
+      <canvas id="ldChart" height="320"></canvas>
+    </div>
+  </section>
+  <section class="cols">
+    <div><h2>月度跟单收益 <span class="tag">模拟</span></h2><div class="panel" id="monthly"></div></div>
+    <div><h2>分市场盈亏 <span class="tag">跟单模拟</span></h2><div class="panel" id="coinpnl"></div></div>
+  </section>
+  <section id="stylesec">
+    <h2>交易风格画像</h2>
+    <div class="cols"><div class="panel" id="stylemetrics"></div><div class="panel" id="styleread"></div></div>
+  </section>
+  <section id="caveats">
+    <h2>方法与数据口径</h2>
+    <div class="note" id="caveatbody"></div>
+  </section>
+</main>
+
+<footer>
+  <span>引擎：动态等比镜像 · taker 4.5bp + 滑点 3bp · 资金费逐小时结算</span>
+  <span>仅供研究，不构成投资建议 · <a href="https://github.com/copyliquid/copyliquid.github.io">源码</a></span>
+</footer>
+</div>
+<div class="tooltip" id="tip"></div>
+<script src="app.js"></script>
+</body>
+</html>

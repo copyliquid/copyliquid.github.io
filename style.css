@@ -1,0 +1,80 @@
+:root {
+  --bg:#0c1512; --panel:#111e1a; --panel2:#0f1a16; --line:#1e312b;
+  --ink:#dcece5; --mut:#7e968c; --faint:#54685f;
+  --mint:#3fd9a4; --red:#e0685c; --amber:#d9a441; --blue:#5aa7d9;
+}
+* { box-sizing:border-box }
+body { background:var(--bg); color:var(--ink);
+  font:15px/1.65 -apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+  margin:0; padding:0 20px 60px }
+.wrap { max-width:1060px; margin:0 auto }
+.mono { font-family:ui-monospace,"SF Mono",Menlo,monospace }
+.hidden { display:none }
+header { padding:44px 0 26px }
+.eyebrow { font-family:ui-monospace,Menlo,monospace; font-size:11px; letter-spacing:.18em; color:var(--mint); text-transform:uppercase }
+h1 { font-size:25px; margin:10px 0 6px; font-weight:650; letter-spacing:-.01em; text-wrap:balance }
+header .sub { margin-top:2px }
+.inputrow { display:flex; gap:10px; margin:18px 0 8px }
+#addr { flex:1; background:var(--panel); border:1px solid var(--line); border-radius:6px;
+  color:var(--ink); font-size:14px; padding:11px 14px; outline:none }
+#addr:focus { border-color:var(--mint) }
+#go { background:var(--mint); color:#06231a; border:none; border-radius:6px; font-size:14px;
+  font-weight:650; padding:0 26px; cursor:pointer }
+#go:hover { filter:brightness(1.1) }
+#go:disabled { background:var(--faint); cursor:wait }
+.examples { font-size:12.5px; color:var(--faint) }
+.examples a { color:var(--mut); text-decoration:none; border-bottom:1px dotted var(--faint) }
+h2 { font-size:15px; font-weight:650; margin:38px 0 4px; display:flex; align-items:baseline; gap:10px }
+h2 .tag { font-family:ui-monospace,Menlo,monospace; font-size:10.5px; letter-spacing:.14em; color:var(--faint); text-transform:uppercase; font-weight:500 }
+.sub { color:var(--mut); font-size:13px; margin:0 0 14px }
+.panel { background:var(--panel2); border:1px solid var(--line); border-radius:6px; padding:16px 16px 10px }
+.plog { font-size:12.5px; color:var(--mut); max-height:220px; overflow-y:auto; padding-bottom:6px }
+.plog .ok { color:var(--mint) } .plog .err { color:var(--red) }
+canvas { width:100%; display:block }
+.legend { display:flex; gap:18px; font-size:12px; color:var(--mut); padding:6px 2px 8px; font-family:ui-monospace,Menlo,monospace }
+.legend i { display:inline-block; width:14px; height:3px; border-radius:2px; vertical-align:middle; margin-right:6px }
+.cols { display:grid; grid-template-columns:1fr 1fr; gap:22px }
+@media (max-width:760px) { .cols { grid-template-columns:1fr } .inputrow { flex-direction:column } #go { padding:11px } }
+.cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(158px,1fr)); gap:10px }
+.card { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:13px 15px 11px }
+.clabel { font-size:11px; letter-spacing:.1em; color:var(--mut); text-transform:uppercase; font-family:ui-monospace,Menlo,monospace }
+.cval { font-size:20px; font-weight:650; margin-top:5px; font-family:ui-monospace,Menlo,monospace; font-variant-numeric:tabular-nums }
+.csub { font-size:12px; color:var(--faint); margin-top:3px }
+.pos { color:var(--mint) } .neg { color:var(--red) } .warn { color:var(--amber) }
+.crow { display:grid; grid-template-columns:minmax(86px,110px) 1fr 108px; gap:12px; align-items:center; padding:7px 2px; border-bottom:1px solid var(--line) }
+.crow:last-child { border-bottom:none }
+.cname { font-family:ui-monospace,Menlo,monospace; font-size:13px }
+.cbar { height:10px; background:#15231e; border-radius:3px; overflow:hidden }
+.cfill { height:100% } .cfill.pos { background:linear-gradient(90deg,#1f7d61,var(--mint)) }
+.cfill.neg { background:linear-gradient(90deg,#8a3d35,var(--red)) }
+.cnum { text-align:right; font-family:ui-monospace,Menlo,monospace; font-size:13px; font-variant-numeric:tabular-nums }
+.note { background:var(--panel); border:1px solid var(--line); border-left:3px solid var(--amber); border-radius:6px;
+  padding:14px 18px; font-size:13.5px; color:var(--mut) }
+.note b, .panel b { color:var(--ink) }
+.note ul { padding-left:18px; margin:6px 0 }
+.note li { margin:5px 0 }
+.vcard { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:20px 22px; margin-top:8px }
+.vcard .addr { font-family:ui-monospace,Menlo,monospace; font-size:12.5px; color:var(--mut); word-break:break-all }
+.vcard .addr a { color:var(--mint); text-decoration:none }
+.chips { display:flex; flex-wrap:wrap; gap:8px; margin:12px 0 }
+.chip { font-family:ui-monospace,Menlo,monospace; font-size:12px; padding:4px 12px; border-radius:99px; border:1px solid var(--line); color:var(--ink); background:var(--panel2) }
+.chip.mint { border-color:#2a6e57; color:var(--mint) }
+.chip.amber { border-color:#7a5c22; color:var(--amber) }
+.chip.red { border-color:#7a352e; color:var(--red) }
+.chip.blue { border-color:#2e5a7a; color:var(--blue) }
+.verdictline { font-size:16px; margin:10px 0 4px }
+.verdictline b { font-size:17px }
+.reasons { color:var(--mut); font-size:13.5px; padding-left:18px; margin:8px 0 0 }
+.reasons li { margin:4px 0 }
+.kv { display:grid; grid-template-columns:auto 1fr; gap:6px 16px; font-size:13.5px; padding:4px 0 8px }
+.kv .k { color:var(--mut); white-space:nowrap }
+.kv .v { font-family:ui-monospace,Menlo,monospace; font-variant-numeric:tabular-nums; text-align:right }
+.mtable { width:100%; border-collapse:collapse; font-family:ui-monospace,Menlo,monospace; font-size:12.5px; font-variant-numeric:tabular-nums }
+.mtable td, .mtable th { padding:5px 8px; text-align:right; border-bottom:1px solid var(--line) }
+.mtable th { color:var(--mut); font-weight:500 }
+.mtable td:first-child, .mtable th:first-child { text-align:left; color:var(--mut) }
+.tooltip { position:fixed; pointer-events:none; background:#081009ee; border:1px solid var(--line); border-radius:5px;
+  padding:7px 11px; font:12px/1.5 ui-monospace,Menlo,monospace; color:var(--ink); display:none; z-index:9; white-space:nowrap }
+footer { margin-top:56px; font-size:12px; color:var(--faint); border-top:1px solid var(--line); padding-top:16px;
+  display:flex; justify-content:space-between; flex-wrap:wrap; gap:8px }
+footer a { color:var(--mut) }
