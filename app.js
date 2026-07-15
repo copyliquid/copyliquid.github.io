@@ -16,28 +16,52 @@ function log(msg, cls) {
   el.scrollTop = el.scrollHeight;
 }
 
-let inflight = 0;
-async function post(body, tries) {
+/* HL 按 IP 限权重(约1200/分钟)。主动限速, 避免 429 螺旋 */
+const RATE_CAP = 700;
+const ledger = [];
+async function withBudget(w) {
+  let warned = false;
+  while (true) {
+    const now = Date.now();
+    while (ledger.length && now - ledger[0][0] > 60_000) ledger.shift();
+    const used = ledger.reduce((s, x) => s + x[1], 0);
+    if (used + w <= RATE_CAP) { ledger.push([Date.now(), w]); return; }
+    if (!warned && Date.now() - (withBudget.lastLog || 0) > 15_000) {
+      withBudget.lastLog = Date.now(); warned = true;
+      log("已达 API 每分钟配额，排队中…（大地址属正常，请耐心）");
+    }
+    await sleep(400);
+  }
+}
+async function post(body, tries, weight) {
   tries = tries || 4;
+  weight = weight || 20;
   for (let i = 0; i < tries; i++) {
+    await withBudget(weight);
+    const ctl = new AbortController();
+    const to = setTimeout(() => ctl.abort("timeout"), 25000);
     try {
-      const r = await fetch(API, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
-      if (r.status === 429) { log(`限流，等 ${4*(i+1)}s…`); await sleep(4000*(i+1)); continue; }
+      const r = await fetch(API, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body), signal: ctl.signal});
+      if (r.status === 429) { log(`触发限流，等 ${10*(i+1)}s…`); await sleep(10000*(i+1)); continue; }
       if (!r.ok) throw new Error("HTTP " + r.status);
       return await r.json();
     } catch (e) {
       if (i === tries - 1) throw e;
+      log(`请求失败(${e.name === "AbortError" ? "超时" : (e.message || e)})，重试 ${i+1}/${tries-1}…`);
       await sleep(1500 * (i + 1));
-    }
+    } finally { clearTimeout(to); }
   }
 }
 
 /* ---------- 数据拉取 ---------- */
-async function fetchPaged(mk, getTime, label) {
+async function fetchPaged(mk, getTime, label, maxPages) {
+  maxPages = maxPages || 60;
   const seen = new Set(), out = [];
+  out.capped = false;
   let start = 0; const now = Date.now();
-  for (let page = 0; page < 60; page++) {
-    const batch = await post(mk(start, now));
+  for (let page = 0; page < maxPages; page++) {
+    if (page === maxPages - 1) out.capped = true;
+    const batch = await post(mk(start, now), 4, 40);
     if (!Array.isArray(batch) || !batch.length) break;
     let added = 0;
     for (const it of batch) {
@@ -50,7 +74,7 @@ async function fetchPaged(mk, getTime, label) {
     const last = getTime(batch[batch.length - 1]);
     if (last <= start && !added) break;
     start = last;              // 重叠分页, tid 去重
-    await sleep(150);
+    await sleep(50);
   }
   return out;
 }
@@ -61,12 +85,20 @@ async function fetchAll(addr) {
   D.portfolio = Object.fromEntries(await post({type: "portfolio", user: addr}));
   D.vault = await post({type: "vaultDetails", vaultAddress: addr}).catch(() => null);
   await sleep(120);
-  D.spot = await post({type: "spotClearinghouseState", user: addr}).catch(() => null);
+  D.spot = await post({type: "spotClearinghouseState", user: addr}, 4, 2).catch(() => null);
 
   log("拉取成交记录…");
   D.fills = await fetchPaged(
     (s, n) => ({type: "userFillsByTime", user: addr, startTime: s, endTime: n, aggregateByTime: false}),
-    b => b.time, "普通成交");
+    b => b.time, "普通成交", 15);  // 权重见 post 调用
+  if (D.fills.capped || D.fills.length >= 28000) {   // 页数打满≈3万笔: 高频/做市账户
+    D.hft = true;
+    D.all = D.fills; D.twaps = [];
+    D.perp = D.fills.filter(f => !f.coin.startsWith("@") && !f.coin.includes("/"));
+    D.spotFills = D.all.length - D.perp.length;
+    log("检测到高频/做市型账户（成交 ≥3 万笔），跳过逐笔回测，改为概要报告", "err");
+    return D;
+  }
   D.twaps = (await fetchPaged(
     (s, n) => ({type: "userTwapSliceFillsByTime", user: addr, startTime: s, endTime: n}),
     b => b.fill.time, "TWAP 切片")).map(t => t.fill);
@@ -91,7 +123,7 @@ async function fetchAll(addr) {
   const dexes = new Set([""]);
   for (const f of D.perp) if (f.coin.includes(":")) dexes.add(f.coin.split(":")[0]);
   for (const dx of dexes) {
-    const st = await post(dx ? {type: "clearinghouseState", user: addr, dex: dx} : {type: "clearinghouseState", user: addr});
+    const st = await post(dx ? {type: "clearinghouseState", user: addr, dex: dx} : {type: "clearinghouseState", user: addr}, 4, 2);
     D.eqNow += parseFloat(st.marginSummary.accountValue);
     for (const p of st.assetPositions || []) D.actual[p.position.coin] = parseFloat(p.position.szi);
     await sleep(120);
@@ -105,17 +137,30 @@ async function fetchAll(addr) {
     if (!win[c]) win[c] = [f.time - DAY, 0];
     win[c][1] = Math.abs(D.actual[c] || 0) > 1e-9 ? now : Math.min(now, f.time + 2 * DAY);
   }
+  // 市场太多时只对成交名义前 40 的市场拉 K线/资金费 (其余用成交价标记)
+  const ntlByCoin = {};
+  for (const f of D.perp) ntlByCoin[f.coin] = (ntlByCoin[f.coin] || 0) + parseFloat(f.px) * parseFloat(f.sz);
+  const allCoins = Object.keys(win);
+  if (allCoins.length > 40) {
+    const keep = new Set(Object.entries(ntlByCoin).sort((a, b) => b[1] - a[1]).slice(0, 40).map(([c]) => c));
+    for (const c of allCoins) if (!keep.has(c)) delete win[c];
+    D.coinCapped = allCoins.length;
+    log(`市场多达 ${allCoins.length} 个，只对成交额前 40 拉行情，其余用成交价标记`, "");
+  }
   // K线: 1d 全窗口 + 1h 近期
   D.candles = {};
-  log("拉取 K 线（" + Object.keys(win).length + " 个市场）…");
+  const nWin = Object.keys(win).length; let wi = 0;
+  log("拉取 K 线（" + nWin + " 个市场）…");
   for (const [c, [t0, t1]] of Object.entries(win)) {
+    wi++; if (wi % 5 === 0) log(`K线进度 ${wi}/${nWin}（${c}）`);
     const px = {};
-    const d1 = await post({type: "candleSnapshot", req: {coin: c, interval: "1d", startTime: t0, endTime: t1}}).catch(() => []);
-    for (const r of d1 || []) px[r.t + DAY] = parseFloat(r.c);
-    await sleep(120);
+    if (t0 < now - 195 * DAY) {  // 只有窗口早于1h覆盖范围才需要日线
+      const d1 = await post({type: "candleSnapshot", req: {coin: c, interval: "1d", startTime: t0, endTime: t1}}, 4, 30).catch(() => []);
+      for (const r of d1 || []) px[r.t + DAY] = parseFloat(r.c);
+    }
     const h0 = Math.max(t0, now - 199 * DAY);
     if (t1 > h0) {
-      const h1 = await post({type: "candleSnapshot", req: {coin: c, interval: "1h", startTime: h0, endTime: t1}}).catch(() => []);
+      const h1 = await post({type: "candleSnapshot", req: {coin: c, interval: "1h", startTime: h0, endTime: t1}}, 4, 30).catch(() => []);
       for (const r of h1 || []) px[r.t + HOUR] = parseFloat(r.c);
       await sleep(120);
     }
@@ -123,8 +168,9 @@ async function fetchAll(addr) {
   }
   // 资金费
   D.funding = {};
-  log("拉取资金费率…");
+  log("拉取资金费率…"); wi = 0;
   for (const [c, [t0, t1]] of Object.entries(win)) {
+    wi++; if (wi % 5 === 0) log(`资金费进度 ${wi}/${nWin}（${c}）`);
     const rows = []; let s = t0;
     for (let p = 0; p < 60; p++) {
       const b = await post({type: "fundingHistory", coin: c, startTime: s, endTime: t1}).catch(() => []);
@@ -739,8 +785,52 @@ function render(addr, D, bt, A) {
     <li><b>TWAP 限制与两段拼接：</b>TWAP 切片明细只保留约最近 2 个月${D.twapEarliest ? `（本地址最早可见 ${fmtD(D.twapEarliest)}）` : ""}。${bt.hybrid ? `更早时段无法逐笔还原（仓位链缺口占比 ${(bt.preGapShare * 100).toFixed(0)}%），因此 <b>${fmtD(bt.simStart)} 之前的曲线用官方 PnL 按权益等比换算</b>（真实业绩、但未计跟单手续费/滑点），之后才是逐笔模拟。` : "本地址缺口很小，全程逐笔模拟。"}逐笔段内仍有 ${bt.nResync} 次小缺口对齐（名义 ${money(bt.resyncNtl)}）和 ${bt.nPhantom} 个合成平仓（名义 ${money(bt.phantomNtl)}）。</li>
     <li><b>成交假设：</b>按该地址成交 VWAP ± ${SLIP_BPS}bp 滑点成交，收 ${FEE_BPS}bp taker 费；未模拟跟单延迟与强平。</li>
     <li><b>标记价格：</b>近 200 天用 1h K线，更早用 1d K线 + 成交价兜底（HL 每周期只保留约 5000 根K线）。</li>
-    <li><b>未包含：</b>现货成交 ${D.spotFills} 笔未复制；${D.truncated ? "<b>成交历史超过 API 1 万笔上限，最早期已截断；</b>" : ""}官方累计 PnL 曲线为 portfolio 端点原始数据，不受以上近似影响。</li>
+    <li><b>未包含：</b>现货成交 ${D.spotFills} 笔未复制；${D.coinCapped ? `交易市场多达 ${D.coinCapped} 个，仅前 40 大拉取了 K 线/资金费，其余用成交价标记；` : ""}${D.truncated ? "<b>成交历史超过 API 1 万笔上限，最早期已截断；</b>" : ""}官方累计 PnL 曲线为 portfolio 端点原始数据，不受以上近似影响。</li>
   </ul>`;
+  for (const id of ["copysec", "tables", "stylesec", "caveats", "leadersec"]) { const el = $(id); if (el) el.classList.remove("hidden"); }
+  $("report").classList.remove("hidden");
+}
+
+/* ---------- 高频账户概要报告 ---------- */
+function renderHFT(addr, D) {
+  const short = addr.slice(0, 6) + "…" + addr.slice(-4);
+  document.title = `Copyliquid · ${short}`;
+  const pnl = buildLeaderPnl(D);
+  const officialPnl = pnl.length ? pnl[pnl.length - 1][1] : 0;
+  const port = D.portfolio.perpAllTime || {};
+  const vlm = parseFloat(port.vlm || 0);
+  const avh = (port.accountValueHistory || []);
+  const eqNow = avh.length ? parseFloat(avh[avh.length - 1][1]) : 0;
+  const moRoi = (() => {
+    const m = (D.portfolio.perpMonth || {}).pnlHistory || [];
+    if (!m.length) return null;
+    const dp = parseFloat(m[m.length - 1][1]) - parseFloat(m[0][1]);
+    return eqNow > 0 ? dp / eqNow : null;
+  })();
+  const chips = [`<span class="chip red">高频 / 做市</span>`];
+  if (eqNow > 1e6 || vlm > 5e7) chips.push(`<span class="chip mint">巨鲸</span>`);
+  $("verdict").innerHTML = `
+    <div class="vcard">
+      <div class="addr"><a href="https://app.hyperliquid.xyz/explorer/address/${addr}">${addr}</a>
+        · <a href="https://hypurrscan.io/address/${addr}">hypurrscan</a></div>
+      <div class="chips">${chips.join("")}</div>
+      <div class="verdictline">可跟单判定 <b class="neg">不可跟单（高频/做市型）</b></div>
+      <ul class="reasons">
+        <li>可见成交已达 ${D.fills.length.toLocaleString()} 笔（API 上限内仍未拉完），为高频/做市式操作</li>
+        <li>此类账户盈利依赖毫秒级执行与返佣，人工或跟单系统复制后成本结构完全不同，逐笔回测无意义</li>
+        <li>下方仅展示其官方累计 PnL 与权益概要</li>
+      </ul>
+    </div>`;
+  const cards = [
+    ["官方累计 PnL", money(officialPnl, true), "perp 全周期", officialPnl >= 0 ? "pos" : "neg"],
+    ["当前权益", money(eqNow), "", ""],
+    ["30 天收益率", moRoi != null ? pct(moRoi) : "—", "官方口径", moRoi >= 0 ? "pos" : "neg"],
+    ["全时段成交量", money(vlm), `可见成交 ${D.fills.length.toLocaleString()}+ 笔`, ""],
+  ];
+  $("cards").innerHTML = '<div class="cards">' + cards.map(([l, v, s, c]) =>
+    `<div class="card"><div class="clabel">${l}</div><div class="cval ${c}">${v}</div><div class="csub">${s}</div></div>`).join("") + "</div>";
+  for (const id of ["copysec", "tables", "stylesec", "caveats"]) { const el = $(id); if (el) el.classList.add("hidden"); }
+  $("leadersec").classList.remove("hidden");
   $("report").classList.remove("hidden");
 }
 
@@ -749,7 +839,7 @@ let running = false;
 async function run(addr) {
   addr = addr.trim().toLowerCase();
   if (!/^0x[0-9a-f]{40}$/.test(addr)) { alert("请输入合法的 0x 地址"); return; }
-  if (running) return;
+  if (running) { log("上一个分析还在进行中，请等它完成后再点（页面同时只能分析一个地址）", "err"); return; }
   running = true;
   $("go").disabled = true; $("go").textContent = "分析中…";
   $("progress").classList.remove("hidden");
@@ -759,6 +849,14 @@ async function run(addr) {
   try {
     const D = await fetchAll(addr);
     if (!D.perp || !D.perp.length) { log("该地址没有可见的 perp 成交记录，无法回测。", "err"); return; }
+    if (D.hft) {
+      renderHFT(addr, D);
+      const A0 = {pnlCurve: buildLeaderPnl(D)};
+      drawLd(A0, D);
+      window.onresize = () => drawLd(A0, D);
+      log("完成（概要模式）✓", "ok");
+      return;
+    }
     log("重建仓位并回测…");
     await sleep(30);
     const bt = runBacktest(D);

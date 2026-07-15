@@ -9,7 +9,7 @@ body { background:var(--bg); color:var(--ink);
   margin:0; padding:0 20px 60px }
 .wrap { max-width:1150px; margin:0 auto }
 .mono { font-family:ui-monospace,"SF Mono",Menlo,monospace }
-.hidden { display:none }
+.hidden { display:none !important }
 header { padding:44px 0 26px }
 .eyebrow { font-family:ui-monospace,Menlo,monospace; font-size:11px; letter-spacing:.18em; color:var(--mint); text-transform:uppercase }
 h1 { font-size:25px; margin:10px 0 6px; font-weight:650; letter-spacing:-.01em; text-wrap:balance }
