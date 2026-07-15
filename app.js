@@ -880,9 +880,10 @@ document.querySelectorAll(".ex").forEach(a => a.onclick = e => { e.preventDefaul
 const q = new URLSearchParams(location.search).get("address");
 if (q) { $("addr").value = q; run(q); }
 
-/* ---------- 发现优质地址 (官方排行榜筛选) ---------- */
+/* ---------- 发现优质地址 (官方排行榜筛选 + 深挖排序) ---------- */
 const LB_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard";
-const LB_CACHE_KEY = "copyliquid_lb_v1", LB_TTL = 6 * HOUR;
+const LB_CACHE_KEY = "copyliquid_lb_v2", LB_TTL = 6 * HOUR;
+let LB_ROWS = null, LB_SORT = "score";
 
 async function fetchLeaderboard() {
   const st = $("lbstatus");
@@ -904,48 +905,142 @@ async function fetchLeaderboard() {
     chunks.push(value); got += value.length;
     st.textContent = `下载官方排行榜… ${(got / 1e6).toFixed(1)} / ${(total / 1e6).toFixed(1)} MB`;
   }
-  st.textContent = "解析与筛选 40,000+ 地址…";
+  st.textContent = "解析与初筛 40,000+ 地址…";
   await sleep(30);
   const buf = new Uint8Array(got); let off = 0;
   for (const c of chunks) { buf.set(c, off); off += c.length; }
   const data = JSON.parse(new TextDecoder().decode(buf));
-  const rows = (data.leaderboardRows || data).map(r => {
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const pool = (data.leaderboardRows || data).map(r => {
     const w = Object.fromEntries(r.windowPerformances);
     const g = k => ({pnl: +w[k].pnl, roi: +w[k].roi, vlm: +w[k].vlm});
     return {a: r.ethAddress, name: r.displayName || "", av: +r.accountValue,
-            d: g("day"), wk: g("week"), mo: g("month"), at: g("allTime")};
-  });
-  // 质量筛选
-  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-  const picked = rows.filter(r =>
+            wk: g("week"), mo: g("month"), at: g("allTime")};
+  }).filter(r =>
       r.av >= 100_000 && r.mo.vlm >= 1e6 &&
-      r.mo.vlm / r.av <= 300 &&            // 排除做市/刷量
-      r.at.pnl > 0 && r.mo.roi > 0 && r.wk.roi > -0.05)
+      r.mo.vlm / r.av <= 300 &&                 // 排除做市/刷量
+      r.at.pnl > 0 && r.mo.roi > -0.1 && r.wk.roi > -0.15)
     .map(r => ({...r, score:
       45 * clamp(r.mo.roi, 0, 1) +
       20 * clamp(r.wk.roi * 2, -1, 1) +
       25 * clamp(r.at.roi / 2, 0, 1) +
       10 * clamp(Math.log10(r.av / 1e5) / 2, 0, 1)}))
     .sort((x, y) => y.score - x.score)
-    .slice(0, 30);
-  try { localStorage.setItem(LB_CACHE_KEY, JSON.stringify({t: Date.now(), rows: picked})); } catch (e) {}
-  return picked;
+    .slice(0, 55);
+
+  // 深挖: 逐个拉 portfolio, 计算近半年/近1年指标 + 聪明钱/信息优势分
+  const out = [];
+  for (let i = 0; i < pool.length; i++) {
+    st.textContent = `深挖候选 ${i + 1}/${pool.length}（拉取全历史 PnL 曲线）…`;
+    try {
+      const port = Object.fromEntries(await post({type: "portfolio", user: pool[i].a}));
+      out.push({...pool[i], ...enrichMetrics(port)});
+    } catch (e) { out.push({...pool[i], ret6m: null}); }
+  }
+  try { localStorage.setItem(LB_CACHE_KEY, JSON.stringify({t: Date.now(), rows: out})); } catch (e) {}
+  return out;
 }
 
-function renderLB(rows) {
+/* 从 portfolio 曲线计算: 近半年收益 / 近1年夏普 / 聪明钱分 / 信息优势分 */
+function enrichMetrics(port) {
+  const D0 = {portfolio: port};
+  const pnl = buildLeaderPnl(D0);                       // [[t, 累计pnl]]
+  const eqm = {};
+  for (const k of ["perpAllTime", "perpMonth", "perpWeek", "perpDay"])
+    for (const [t, v] of ((port[k] || {}).accountValueHistory || [])) eqm[+t] = parseFloat(v);
+  const eqArr = Object.entries(eqm).map(([t, v]) => [+t, v]).sort((x, y) => x[0] - y[0]);
+  if (pnl.length < 5 || !eqArr.length) return {ret6m: null};
+  const now = pnl[pnl.length - 1][0];
+  const interp = (arr, t) => {
+    let i = arr.findIndex(x => x[0] > t);
+    if (i === 0) return arr[0][1];
+    if (i < 0) return arr[arr.length - 1][1];
+    const w = (t - arr[i-1][0]) / (arr[i][0] - arr[i-1][0]);
+    return arr[i-1][1] * (1 - w) + arr[i][1] * w;
+  };
+  const peakEq = Math.max(...eqArr.map(x => x[1]), 50_000);
+  const eqAt = t => Math.max(interp(eqArr, t), peakEq * 0.15, 50_000);
+  // 近半年 / 近1年收益 (Δpnl / 窗口起点权益)
+  const ret = days => {
+    const t0 = now - days * DAY;
+    if (pnl[0][0] > t0 + 30 * DAY) return null;  // 历史不足
+    return (pnl[pnl.length-1][1] - interp(pnl, t0)) / eqAt(t0);
+  };
+  const ret6m = ret(182), ret1y = ret(365);
+  // 近1年夏普: 用 pnl 采样点的期间收益(Δpnl/当期权益), 按采样间隔年化
+  const win = pnl.filter(([t]) => t >= now - 365 * DAY);
+  const rets = [], dts = [];
+  for (let i = 1; i < win.length; i++) {
+    const dt = (win[i][0] - win[i-1][0]) / DAY;
+    if (dt <= 0) continue;
+    rets.push((win[i][1] - win[i-1][1]) / eqAt(win[i-1][0]));
+    dts.push(dt);
+  }
+  let sharpe1y = null;
+  if (rets.length >= 8) {
+    const mu = rets.reduce((s, r) => s + r, 0) / rets.length;
+    const sd = Math.sqrt(rets.reduce((s, r) => s + (r - mu) ** 2, 0) / rets.length);
+    const avgDt = dts.reduce((s, d) => s + d, 0) / dts.length;
+    sharpe1y = sd > 0 ? (mu / sd) * Math.sqrt(365 / avgDt) : null;
+  }
+  // pnl 曲线回撤 (相对峰值权益)
+  let peak = -1e18, mdd = 0;
+  for (const [, v] of pnl) { peak = Math.max(peak, v); mdd = Math.max(mdd, (peak - v) / peakEq); }
+  // 盈利集中度: 前3大正跳占全部正收益之比 (信息/事件驱动特征)
+  const pos = rets.filter(r => r > 0).sort((x, y) => y - x);
+  const posSum = pos.reduce((s, r) => s + r, 0);
+  const conc = posSum > 0 ? pos.slice(0, 3).reduce((s, r) => s + r, 0) / posSum : 0;
+  const winShare = rets.length ? rets.filter(r => r > 0).length / rets.length : 0;
+  const histDays = (now - pnl[0][0]) / DAY;
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  // 聪明钱分: 长期赚钱 + 风险调整后优 + 稳定
+  const smart = Math.round(clamp(
+    30 * clamp((ret1y == null ? (ret6m || 0) * 2 : ret1y) / 2, 0, 1) +
+    30 * clamp((sharpe1y || 0) / 3, 0, 1) +
+    20 * clamp(winShare * 1.6 - 0.5, 0, 1) +
+    10 * clamp(1 - mdd / 0.6, 0, 1) +
+    10 * clamp(histDays / 540, 0, 1), 0, 100));
+  // 信息优势分(统计信号): 收益高度集中于少数几笔 + 胜率高 + 短史暴利加成
+  const insider = Math.round(clamp(
+    45 * clamp((conc - 0.4) / 0.5, 0, 1) +
+    30 * clamp(winShare * 1.8 - 0.7, 0, 1) +
+    25 * clamp(((ret6m || 0) - 0.5) / 2, 0, 1), 0, 100));
+  return {ret6m, ret1y, sharpe1y, smart, insider, mdd, histDays: Math.round(histDays)};
+}
+
+const LB_SORTS = [
+  ["score",   "综合(30天)",   r => r.score],
+  ["ret6m",   "近半年收益",   r => r.ret6m ?? -9],
+  ["sharpe1y","近1年夏普",    r => r.sharpe1y ?? -9],
+  ["smart",   "聪明钱分",     r => r.smart ?? -9],
+  ["insider", "信息优势分",   r => r.insider ?? -9],
+];
+
+function renderLB() {
+  const rows = [...LB_ROWS].sort((x, y) => {
+    const key = LB_SORTS.find(s => s[0] === LB_SORT)[2];
+    return key(y) - key(x);
+  }).slice(0, 30);
   const st = $("lbstatus");
-  st.textContent = `共筛出 ${rows.length} 个候选（数据为官方 perp 排行榜口径）`;
+  st.innerHTML = LB_SORTS.map(([k, label]) =>
+    `<button class="sortbtn${k === LB_SORT ? " on" : ""}" data-k="${k}">${label}</button>`).join("") +
+    `<span style="margin-left:12px">深挖了 ${LB_ROWS.length} 个初筛候选 · 近半年/夏普由官方 PnL 曲线估算 · 信息优势分仅为统计信号</span>`;
   const fm = v => (v < 0 ? "−" : "") + "$" + (Math.abs(v) >= 1e6 ? (Math.abs(v) / 1e6).toFixed(2) + "M" : Math.round(Math.abs(v) / 1e3) + "k");
-  const fp = v => `<span class="${v >= 0 ? "pos" : "neg"}">${(v >= 0 ? "+" : "−") + Math.abs(v * 100).toFixed(1)}%</span>`;
+  const fp = v => v == null ? "—" : `<span class="${v >= 0 ? "pos" : "neg"}">${(v >= 0 ? "+" : "−") + Math.abs(v * 100).toFixed(0)}%</span>`;
+  const fs = v => v == null ? "—" : `<span class="${v >= 1 ? "pos" : ""}">${v.toFixed(2)}</span>`;
+  const fscore = v => v == null ? "—" : `<span class="${v >= 60 ? "pos" : v >= 30 ? "warn" : ""}">${v}</span>`;
   $("lbbody").innerHTML = `<table class="lbtable">
-    <thead><tr><th>#&nbsp;&nbsp;地址</th><th>权益</th><th>30d ROI</th><th>30d PnL</th><th>7d ROI</th><th>全期 PnL</th><th>30d 成交</th><th></th></tr></thead>
+    <thead><tr><th>#&nbsp;&nbsp;地址</th><th>权益</th><th>30d ROI</th><th>近半年</th><th>近1年</th><th>夏普1Y</th><th>聪明钱</th><th>信息分</th><th>史长</th><th></th></tr></thead>
     <tbody>` + rows.map((r, i) => `
       <tr data-a="${r.a}">
-        <td>${i + 1}&nbsp;&nbsp;<span title="${r.a}">${r.a.slice(0, 6)}…${r.a.slice(-4)}</span>${r.name ? `<span class="lbname">${r.name.slice(0, 18)}</span>` : ""}</td>
-        <td>${fm(r.av)}</td><td>${fp(r.mo.roi)}</td><td>${fm(r.mo.pnl)}</td>
-        <td>${fp(r.wk.roi)}</td><td>${fm(r.at.pnl)}</td><td>${fm(r.mo.vlm)}</td>
+        <td>${i + 1}&nbsp;&nbsp;<span title="${r.a}">${r.a.slice(0, 6)}…${r.a.slice(-4)}</span>${r.name ? `<span class="lbname">${r.name.slice(0, 14)}</span>` : ""}</td>
+        <td>${fm(r.av)}</td><td>${fp(r.mo.roi)}</td><td>${fp(r.ret6m)}</td><td>${fp(r.ret1y)}</td>
+        <td>${fs(r.sharpe1y)}</td><td>${fscore(r.smart)}</td><td>${fscore(r.insider)}</td>
+        <td>${r.histDays ? r.histDays + "d" : "—"}</td>
         <td><button class="ana">分析</button></td>
       </tr>`).join("") + "</tbody></table>";
+  document.querySelectorAll(".sortbtn").forEach(b =>
+    b.onclick = e => { e.stopPropagation(); LB_SORT = b.dataset.k; renderLB(); });
   document.querySelectorAll("#lbbody tbody tr").forEach(tr =>
     tr.onclick = () => { const a = tr.dataset.a; $("addr").value = a; run(a); });
 }
@@ -954,7 +1049,7 @@ $("discover").onclick = async () => {
   const btn = $("discover");
   btn.disabled = true; btn.textContent = "筛选中…";
   $("discoverSec").classList.remove("hidden");
-  try { renderLB(await fetchLeaderboard()); }
+  try { LB_ROWS = await fetchLeaderboard(); renderLB(); }
   catch (e) { $("lbstatus").textContent = "出错：" + (e.message || e); }
   finally { btn.disabled = false; btn.textContent = "✦ 发现优质地址"; }
 };

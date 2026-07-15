@@ -98,3 +98,7 @@ footer a { color:var(--mut) }
   font-size:12px; font-weight:650; cursor:pointer; font-family:inherit }
 .lbname { color:var(--mut); font-size:12px; margin-left:6px }
 #lbstatus { font-size:13px; color:var(--mut); padding:2px 0 8px; font-family:ui-monospace,Menlo,monospace }
+.sortbtn { background:transparent; border:1px solid var(--line); color:var(--mut); border-radius:99px;
+  font-size:12px; padding:3px 12px; margin-right:6px; cursor:pointer; font-family:inherit }
+.sortbtn.on { border-color:#2a6e57; color:var(--mint); background:#12251e }
+.sortbtn:hover { color:var(--ink) }
