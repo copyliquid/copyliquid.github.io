@@ -781,3 +781,82 @@ $("addr").addEventListener("keydown", e => { if (e.key === "Enter") run($("addr"
 document.querySelectorAll(".ex").forEach(a => a.onclick = e => { e.preventDefault(); $("addr").value = a.textContent; run(a.textContent); });
 const q = new URLSearchParams(location.search).get("address");
 if (q) { $("addr").value = q; run(q); }
+
+/* ---------- 发现优质地址 (官方排行榜筛选) ---------- */
+const LB_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard";
+const LB_CACHE_KEY = "copyliquid_lb_v1", LB_TTL = 6 * HOUR;
+
+async function fetchLeaderboard() {
+  const st = $("lbstatus");
+  try {
+    const cached = JSON.parse(localStorage.getItem(LB_CACHE_KEY) || "null");
+    if (cached && Date.now() - cached.t < LB_TTL) {
+      st.textContent = `使用 ${Math.round((Date.now() - cached.t) / 60000)} 分钟前的缓存（每 6 小时自动刷新）`;
+      return cached.rows;
+    }
+  } catch (e) {}
+  const resp = await fetch(LB_URL);
+  if (!resp.ok) throw new Error("排行榜下载失败 HTTP " + resp.status);
+  const total = +resp.headers.get("Content-Length") || 33e6;
+  const reader = resp.body.getReader();
+  const chunks = []; let got = 0;
+  while (true) {
+    const {done, value} = await reader.read();
+    if (done) break;
+    chunks.push(value); got += value.length;
+    st.textContent = `下载官方排行榜… ${(got / 1e6).toFixed(1)} / ${(total / 1e6).toFixed(1)} MB`;
+  }
+  st.textContent = "解析与筛选 40,000+ 地址…";
+  await sleep(30);
+  const buf = new Uint8Array(got); let off = 0;
+  for (const c of chunks) { buf.set(c, off); off += c.length; }
+  const data = JSON.parse(new TextDecoder().decode(buf));
+  const rows = (data.leaderboardRows || data).map(r => {
+    const w = Object.fromEntries(r.windowPerformances);
+    const g = k => ({pnl: +w[k].pnl, roi: +w[k].roi, vlm: +w[k].vlm});
+    return {a: r.ethAddress, name: r.displayName || "", av: +r.accountValue,
+            d: g("day"), wk: g("week"), mo: g("month"), at: g("allTime")};
+  });
+  // 质量筛选
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const picked = rows.filter(r =>
+      r.av >= 100_000 && r.mo.vlm >= 1e6 &&
+      r.mo.vlm / r.av <= 300 &&            // 排除做市/刷量
+      r.at.pnl > 0 && r.mo.roi > 0 && r.wk.roi > -0.05)
+    .map(r => ({...r, score:
+      45 * clamp(r.mo.roi, 0, 1) +
+      20 * clamp(r.wk.roi * 2, -1, 1) +
+      25 * clamp(r.at.roi / 2, 0, 1) +
+      10 * clamp(Math.log10(r.av / 1e5) / 2, 0, 1)}))
+    .sort((x, y) => y.score - x.score)
+    .slice(0, 30);
+  try { localStorage.setItem(LB_CACHE_KEY, JSON.stringify({t: Date.now(), rows: picked})); } catch (e) {}
+  return picked;
+}
+
+function renderLB(rows) {
+  const st = $("lbstatus");
+  st.textContent = `共筛出 ${rows.length} 个候选（数据为官方 perp 排行榜口径）`;
+  const fm = v => (v < 0 ? "−" : "") + "$" + (Math.abs(v) >= 1e6 ? (Math.abs(v) / 1e6).toFixed(2) + "M" : Math.round(Math.abs(v) / 1e3) + "k");
+  const fp = v => `<span class="${v >= 0 ? "pos" : "neg"}">${(v >= 0 ? "+" : "−") + Math.abs(v * 100).toFixed(1)}%</span>`;
+  $("lbbody").innerHTML = `<table class="lbtable">
+    <thead><tr><th>#&nbsp;&nbsp;地址</th><th>权益</th><th>30d ROI</th><th>30d PnL</th><th>7d ROI</th><th>全期 PnL</th><th>30d 成交</th><th></th></tr></thead>
+    <tbody>` + rows.map((r, i) => `
+      <tr data-a="${r.a}">
+        <td>${i + 1}&nbsp;&nbsp;<span title="${r.a}">${r.a.slice(0, 6)}…${r.a.slice(-4)}</span>${r.name ? `<span class="lbname">${r.name.slice(0, 18)}</span>` : ""}</td>
+        <td>${fm(r.av)}</td><td>${fp(r.mo.roi)}</td><td>${fm(r.mo.pnl)}</td>
+        <td>${fp(r.wk.roi)}</td><td>${fm(r.at.pnl)}</td><td>${fm(r.mo.vlm)}</td>
+        <td><button class="ana">分析</button></td>
+      </tr>`).join("") + "</tbody></table>";
+  document.querySelectorAll("#lbbody tbody tr").forEach(tr =>
+    tr.onclick = () => { const a = tr.dataset.a; $("addr").value = a; run(a); });
+}
+
+$("discover").onclick = async () => {
+  const btn = $("discover");
+  btn.disabled = true; btn.textContent = "筛选中…";
+  $("discoverSec").classList.remove("hidden");
+  try { renderLB(await fetchLeaderboard()); }
+  catch (e) { $("lbstatus").textContent = "出错：" + (e.message || e); }
+  finally { btn.disabled = false; btn.textContent = "✦ 发现优质地址"; }
+};

@@ -17,9 +17,16 @@
   <div class="inputrow">
     <input id="addr" class="mono" placeholder="0x… 粘贴 Hyperliquid 地址" spellcheck="false">
     <button id="go">开始分析</button>
+    <button id="discover" title="下载官方排行榜(约33MB)并按质量分筛选">✦ 发现优质地址</button>
   </div>
   <div class="examples">示例：<a href="#" class="ex mono">0xa65ce1d604fa901c13aa29f2126a57d9032e412b</a></div>
 </header>
+
+<section id="discoverSec" class="hidden">
+  <h2>优质地址榜单 <span class="tag">official leaderboard · 4万+ 地址实时筛选</span></h2>
+  <p class="sub">筛选条件：权益 ≥ $10万、30 天成交 ≥ $100万、全期与 30 天均盈利、排除做市/高频刷量（月成交 &gt; 权益 300 倍）；按 30 天 ROI 与全期 ROI 加权排序。点击任意一行开始深度分析。</p>
+  <div class="panel"><div id="lbstatus"></div><div class="lbwrap" id="lbbody"></div></div>
+</section>
 
 <section id="progress" class="hidden">
   <div class="panel"><div id="plog" class="plog mono"></div></div>
