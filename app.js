@@ -696,14 +696,15 @@ function drawEq(bt) {
   };
   cv.onmouseleave = () => $("tip").style.display = "none";
 }
-function drawLd(A, D) {
-  const cv = $("ldChart"), [ctx, W, H] = setup(cv);
-  ctx.clearRect(0, 0, W, H);
-  const pnl = A.pnlCurve;
+function eqPairsOf(D) {
   const eqm = {};
   for (const k of ["perpAllTime", "perpMonth", "perpWeek", "perpDay"])
     for (const [t, v] of ((D.portfolio[k] || {}).accountValueHistory || [])) eqm[+t] = parseFloat(v);
-  const eq = Object.entries(eqm).map(([t, v]) => [+t, v]).sort((a, b) => a[0] - b[0]);
+  return Object.entries(eqm).map(([t, v]) => [+t, v]).sort((a, b) => a[0] - b[0]);
+}
+function drawLd(pnl, eq) {
+  const cv = $("ldChart"), [ctx, W, H] = setup(cv);
+  ctx.clearRect(0, 0, W, H);
   if (!pnl.length) return;
   const PL = 66, PR = 62, PT = 14, PB = 34;
   const x0 = pnl[0][0], x1 = pnl[pnl.length-1][0];
@@ -877,25 +878,59 @@ function renderHFT(addr, D) {
 
 /* ---------- 主流程 ---------- */
 let running = false;
+const DATA_BASE = "https://copyliquid.github.io/data";
+const IS_PRECOMPUTE = new URLSearchParams(location.search).has("precompute");
+async function tryPrecomputed(addr) {
+  if (IS_PRECOMPUTE) return false;
+  try {
+    const r = await fetch(`${DATA_BASE}/addr/${addr}.json`, {cache: "no-cache"});
+    if (!r.ok) return false;
+    const p = await r.json();
+    if (!p.html) return false;
+    $("report").innerHTML = p.html;
+    $("report").classList.remove("hidden");
+    const redraw = () => {
+      if (p.eqc && $("eqChart")) drawEq(p.eqc);
+      if (p.ld && $("ldChart")) drawLd(p.ld.pnl, p.ld.eq);
+    };
+    redraw(); window.onresize = redraw;
+    const age = Math.round((Date.now() - p.t) / 3600_000 * 10) / 10;
+    log(`已加载预计算结果（${age} 小时前，由后台机器人算好） · <a href="#" id="freshLink" style="color:var(--mint)">点此现场重算最新数据</a>`, "ok");
+    const fl = document.getElementById("freshLink");
+    if (fl) fl.onclick = e => { e.preventDefault(); runLive(addr); };
+    return true;
+  } catch (e) { return false; }
+}
 async function run(addr) {
-  addr = addr.trim().toLowerCase();
+  addr = (addr || "").trim().toLowerCase();
   if (!/^0x[0-9a-f]{40}$/.test(addr)) { alert("请输入合法的 0x 地址"); return; }
   if (running) { log("上一个分析还在进行中，请等它完成后再点（页面同时只能分析一个地址）", "err"); return; }
+  $("progress").classList.remove("hidden");
+  $("plog").innerHTML = "";
+  $("progress").scrollIntoView({behavior: "smooth", block: "start"});
+  history.replaceState(null, "", "?address=" + addr);
+  log("查询预计算缓存…");
+  if (await tryPrecomputed(addr)) return;
+  return runLive(addr);
+}
+async function runLive(addr) {
+  if (running) return;
   running = true;
   $("go").disabled = true; $("go").textContent = "分析中…";
   $("progress").classList.remove("hidden");
   $("report").classList.add("hidden");
   $("plog").innerHTML = "";
-  $("progress").scrollIntoView({behavior: "smooth", block: "start"});
-  history.replaceState(null, "", "?address=" + addr);
   try {
     const D = await fetchAll(addr);
     if (!D.perp || !D.perp.length) { log("该地址没有可见的 perp 成交记录，无法回测。", "err"); return; }
+    const eqPairs = eqPairsOf(D);
     if (D.hft) {
       renderHFT(addr, D);
-      const A0 = {pnlCurve: buildLeaderPnl(D)};
-      drawLd(A0, D);
-      window.onresize = () => drawLd(A0, D);
+      const pnlC = buildLeaderPnl(D);
+      drawLd(pnlC, eqPairs);
+      window.onresize = () => drawLd(pnlC, eqPairs);
+      window.__RESULT = {v: 1, t: Date.now(), addr, html: $("report").innerHTML,
+                         ld: {pnl: pnlC, eq: eqPairs}};
       log("完成（概要模式）✓", "ok");
       return;
     }
@@ -904,9 +939,12 @@ async function run(addr) {
     const bt = runBacktest(D);
     const A = analyze(D, bt);
     render(addr, D, bt, A);
-    drawEq(bt); drawLd(A, D);
-    const redraw = () => { drawEq(bt); drawLd(A, D); };
+    drawEq(bt); drawLd(A.pnlCurve, eqPairs);
+    const redraw = () => { drawEq(bt); drawLd(A.pnlCurve, eqPairs); };
     window.onresize = redraw;
+    window.__RESULT = {v: 1, t: Date.now(), addr, html: $("report").innerHTML,
+                       eqc: {curve: downsample(bt.curve, 2200), cliff: bt.cliff},
+                       ld: {pnl: A.pnlCurve, eq: eqPairs}};
     log("完成 ✓", "ok");
   } catch (e) {
     console.error(e);
@@ -1066,7 +1104,16 @@ function renderLB() {
   const st = $("lbstatus");
   st.innerHTML = LB_SORTS.map(([k, label]) =>
     `<button class="sortbtn${k === LB_SORT ? " on" : ""}" data-k="${k}">${label}</button>`).join("") +
-    `<span style="margin-left:12px">深挖了 ${LB_ROWS.length} 个初筛候选 · 近半年/夏普由官方 PnL 曲线估算 · 信息优势分仅为统计信号</span>`;
+    `<span style="margin-left:12px">深挖了 ${LB_ROWS.length} 个初筛候选` +
+    (LB_PRE_TS ? ` · 预计算于 ${Math.round((Date.now() - LB_PRE_TS) / 3600_000 * 10) / 10} 小时前 <a href="#" id="lbFresh" style="color:var(--mint)">现场重筛</a>` : "") +
+    ` · 信息优势分仅为统计信号</span>`;
+  const lf = document.getElementById("lbFresh");
+  if (lf) lf.onclick = async e => {
+    e.preventDefault();
+    localStorage.removeItem(LB_CACHE_KEY);
+    $("lbstatus").textContent = "现场重筛中…";
+    LB_ROWS = await fetchLeaderboard(); LB_PRE_TS = null; renderLB();
+  };
   const fm = v => (v < 0 ? "−" : "") + "$" + (Math.abs(v) >= 1e6 ? (Math.abs(v) / 1e6).toFixed(2) + "M" : Math.round(Math.abs(v) / 1e3) + "k");
   const fp = v => v == null ? "—" : `<span class="${v >= 0 ? "pos" : "neg"}">${(v >= 0 ? "+" : "−") + Math.abs(v * 100).toFixed(0)}%</span>`;
   const fs = v => v == null ? "—" : `<span class="${v >= 1 ? "pos" : ""}">${v.toFixed(2)}</span>`;
@@ -1087,11 +1134,27 @@ function renderLB() {
     tr.onclick = () => { const a = tr.dataset.a; $("addr").value = a; run(a); });
 }
 
+async function tryPrecomputedLB() {
+  if (IS_PRECOMPUTE) return false;
+  try {
+    const r = await fetch(`${DATA_BASE}/leaderboard.json`, {cache: "no-cache"});
+    if (!r.ok) return false;
+    const p = await r.json();
+    if (!Array.isArray(p.rows) || !p.rows.length) return false;
+    LB_ROWS = p.rows; LB_PRE_TS = p.t;
+    renderLB();
+    return true;
+  } catch (e) { return false; }
+}
+let LB_PRE_TS = null;
 $("discover").onclick = async () => {
   const btn = $("discover");
   btn.disabled = true; btn.textContent = "筛选中…";
   $("discoverSec").classList.remove("hidden");
-  try { LB_ROWS = await fetchLeaderboard(); renderLB(); }
+  try {
+    if (!(await tryPrecomputedLB())) { LB_ROWS = await fetchLeaderboard(); LB_PRE_TS = null; renderLB(); }
+    window.__LB = {v: 1, t: Date.now(), rows: LB_ROWS};
+  }
   catch (e) { $("lbstatus").textContent = "出错：" + (e.message || e); }
   finally { btn.disabled = false; btn.textContent = "✦ 发现优质地址"; }
 };
