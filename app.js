@@ -878,7 +878,7 @@ function renderHFT(addr, D) {
 
 /* ---------- 主流程 ---------- */
 let running = false;
-const DATA_BASE = "https://copyliquid.github.io/data";
+const DATA_BASE = "data";  // 相对路径: GH Pages 与 Knight 域名通用
 const IS_PRECOMPUTE = new URLSearchParams(location.search).has("precompute");
 async function tryPrecomputed(addr) {
   if (IS_PRECOMPUTE) return false;
