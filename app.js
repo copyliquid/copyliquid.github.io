@@ -17,7 +17,7 @@ function log(msg, cls) {
 }
 
 /* HL 按 IP 限权重(约1200/分钟)。主动限速, 避免 429 螺旋 */
-const RATE_CAP = 700;
+const RATE_CAP = 1150;
 const ledger = [];
 async function withBudget(w) {
   let warned = false;
@@ -61,7 +61,7 @@ async function fetchPaged(mk, getTime, label, maxPages) {
   let start = 0; const now = Date.now();
   for (let page = 0; page < maxPages; page++) {
     if (page === maxPages - 1) out.capped = true;
-    const batch = await post(mk(start, now), 4, 40);
+    const batch = await post(mk(start, now), 4, 20);
     if (!Array.isArray(batch) || !batch.length) break;
     let added = 0;
     for (const it of batch) {
@@ -75,6 +75,39 @@ async function fetchPaged(mk, getTime, label, maxPages) {
     if (last <= start && !added) break;
     start = last;              // 重叠分页, tid 去重
     await sleep(50);
+  }
+  return out;
+}
+
+
+/* 每个 coin 的实际持仓时段 (顺序无关重放, 间隔<3天合并, pad±6h) */
+function heldSpans(perp) {
+  const by = {};
+  for (const f of perp) (by[f.coin] = by[f.coin] || []).push(f);
+  const out = {}; const now = Date.now();
+  for (const [c, fs] of Object.entries(by)) {
+    const groups = new Map();
+    for (const f of fs) { if (!groups.has(f.time)) groups.set(f.time, []); groups.get(f.time).push(f); }
+    let pos = null, openT = null; const spans = [];
+    for (const [t, g] of [...groups.entries()].sort((x, y) => x[0] - y[0])) {
+      const sps = g.map(f => parseFloat(f.startPosition));
+      if (pos === null) pos = sps.reduce((p, q) => Math.abs(q) < Math.abs(p) ? q : p, sps[0]);
+      else if (!sps.some(sp => Math.abs(pos - sp) <= Math.max(1e-3, Math.abs(sp) * 1e-5)))
+        pos = sps.reduce((p, q) => Math.abs(q - pos) < Math.abs(p - pos) ? q : p);
+      const delta = g.reduce((s, f) => s + parseFloat(f.sz) * (f.side === "B" ? 1 : -1), 0);
+      const before = pos; pos += delta;
+      if (Math.abs(pos) < 1e-9) pos = 0;
+      if (openT === null && (Math.abs(before) > 1e-9 || Math.abs(pos) > 1e-9)) openT = t;
+      if (openT !== null && pos === 0) { spans.push([openT, t]); openT = null; }
+    }
+    if (openT !== null) spans.push([openT, now]);
+    const merged = [];
+    for (const [s, e] of spans) {
+      if (merged.length && s - merged[merged.length - 1][1] < 3 * DAY)
+        merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], e);
+      else merged.push([s, e]);
+    }
+    out[c] = merged.map(([s, e]) => [s - 6 * HOUR, Math.min(e + 6 * HOUR, now)]);
   }
   return out;
 }
@@ -129,59 +162,67 @@ async function fetchAll(addr) {
     await sleep(120);
   }
 
-  // 各 coin 活跃窗口
+  // 实际持仓时段 (只为这些区间拉行情)
   const now = Date.now();
-  const win = {};
-  for (const f of D.perp) {
-    const c = f.coin;
-    if (!win[c]) win[c] = [f.time - DAY, 0];
-    win[c][1] = Math.abs(D.actual[c] || 0) > 1e-9 ? now : Math.min(now, f.time + 2 * DAY);
-  }
-  // 市场太多时只对成交名义前 40 的市场拉 K线/资金费 (其余用成交价标记)
+  const spans = heldSpans(D.perp);
+  // 市场太多时只保留成交名义前 25
   const ntlByCoin = {};
   for (const f of D.perp) ntlByCoin[f.coin] = (ntlByCoin[f.coin] || 0) + parseFloat(f.px) * parseFloat(f.sz);
-  const allCoins = Object.keys(win);
-  if (allCoins.length > 40) {
-    const keep = new Set(Object.entries(ntlByCoin).sort((a, b) => b[1] - a[1]).slice(0, 40).map(([c]) => c));
-    for (const c of allCoins) if (!keep.has(c)) delete win[c];
+  const allCoins = Object.keys(spans);
+  if (allCoins.length > 25) {
+    const keep = new Set(Object.entries(ntlByCoin).sort((a, b) => b[1] - a[1]).slice(0, 25).map(([c]) => c));
+    for (const c of allCoins) if (!keep.has(c)) delete spans[c];
     D.coinCapped = allCoins.length;
-    log(`市场多达 ${allCoins.length} 个，只对成交额前 40 拉行情，其余用成交价标记`, "");
+    log(`市场多达 ${allCoins.length} 个，只对成交额前 25 拉行情，其余用成交价标记`);
   }
-  // K线: 1d 全窗口 + 1h 近期
+  // 预估请求量
+  let planned = 0;
+  for (const [c, ss] of Object.entries(spans)) {
+    for (const [s, e] of ss) {
+      if (e > now - 199 * DAY) planned++;                       // 1h K线
+      planned += Math.min(Math.ceil((e - s) / (480 * HOUR)), 4); // 资金费
+    }
+    if (ss.length && ss[0][0] < now - 195 * DAY) planned++;      // 1d K线
+  }
+  log(`开始拉行情与资金费（约 ${planned} 个请求，大地址请耐心）…`);
+
+  // K线: 每个持仓时段一次 1h 调用(近200天内), 老时段整窗一次 1d
   D.candles = {};
-  const nWin = Object.keys(win).length; let wi = 0;
-  log("拉取 K 线（" + nWin + " 个市场）…");
-  for (const [c, [t0, t1]] of Object.entries(win)) {
-    wi++; if (wi % 5 === 0) log(`K线进度 ${wi}/${nWin}（${c}）`);
+  const nCoin = Object.keys(spans).length; let wi = 0;
+  for (const [c, ss] of Object.entries(spans)) {
+    wi++; if (wi % 5 === 0) log(`K线进度 ${wi}/${nCoin}（${c}）`);
     const px = {};
-    if (t0 < now - 195 * DAY) {  // 只有窗口早于1h覆盖范围才需要日线
-      const d1 = await post({type: "candleSnapshot", req: {coin: c, interval: "1d", startTime: t0, endTime: t1}}, 4, 30).catch(() => []);
+    if (ss.length && ss[0][0] < now - 195 * DAY) {
+      const d1 = await post({type: "candleSnapshot", req: {coin: c, interval: "1d",
+        startTime: ss[0][0], endTime: ss[ss.length - 1][1]}}, 4, 15).catch(() => []);
       for (const r of d1 || []) px[r.t + DAY] = parseFloat(r.c);
     }
-    const h0 = Math.max(t0, now - 199 * DAY);
-    if (t1 > h0) {
-      const h1 = await post({type: "candleSnapshot", req: {coin: c, interval: "1h", startTime: h0, endTime: t1}}, 4, 30).catch(() => []);
+    for (const [s, e] of ss) {
+      if (e <= now - 199 * DAY) continue;
+      const h1 = await post({type: "candleSnapshot", req: {coin: c, interval: "1h",
+        startTime: Math.max(s, now - 199 * DAY), endTime: e}}, 4, 15).catch(() => []);
       for (const r of h1 || []) px[r.t + HOUR] = parseFloat(r.c);
-      await sleep(120);
     }
     D.candles[c] = px;
   }
-  // 资金费
+  // 资金费: 只拉持仓时段, 每段最多4页
   D.funding = {};
-  log("拉取资金费率…"); wi = 0;
-  for (const [c, [t0, t1]] of Object.entries(win)) {
-    wi++; if (wi % 5 === 0) log(`资金费进度 ${wi}/${nWin}（${c}）`);
-    const rows = []; let s = t0;
-    for (let p = 0; p < 60; p++) {
-      const b = await post({type: "fundingHistory", coin: c, startTime: s, endTime: t1}).catch(() => []);
-      if (!Array.isArray(b) || !b.length) break;
-      for (const r of b) rows.push([r.time, parseFloat(r.fundingRate)]);
-      const last = b[b.length - 1].time;
-      if (last <= s || b.length < 400) break;
-      s = last + 1;
-      await sleep(120);
+  wi = 0;
+  for (const [c, ss] of Object.entries(spans)) {
+    wi++; if (wi % 5 === 0) log(`资金费进度 ${wi}/${nCoin}（${c}）`);
+    const rows = [];
+    for (const [s0, e] of ss) {
+      let s = s0;
+      for (let p = 0; p < 4; p++) {
+        const b = await post({type: "fundingHistory", coin: c, startTime: s, endTime: e}, 4, 15).catch(() => []);
+        if (!Array.isArray(b) || !b.length) break;
+        for (const r of b) rows.push([r.time, parseFloat(r.fundingRate)]);
+        const last = b[b.length - 1].time;
+        if (last <= s || last >= e || b.length < 400) break;
+        s = last + 1;
+      }
     }
-    rows.sort((a, b) => a[0] - b[0]);
+    rows.sort((x, y) => x[0] - y[0]);
     D.funding[c] = rows;
   }
   log("数据拉取完成", "ok");
@@ -785,7 +826,7 @@ function render(addr, D, bt, A) {
     <li><b>TWAP 限制与两段拼接：</b>TWAP 切片明细只保留约最近 2 个月${D.twapEarliest ? `（本地址最早可见 ${fmtD(D.twapEarliest)}）` : ""}。${bt.hybrid ? `更早时段无法逐笔还原（仓位链缺口占比 ${(bt.preGapShare * 100).toFixed(0)}%），因此 <b>${fmtD(bt.simStart)} 之前的曲线用官方 PnL 按权益等比换算</b>（真实业绩、但未计跟单手续费/滑点），之后才是逐笔模拟。` : "本地址缺口很小，全程逐笔模拟。"}逐笔段内仍有 ${bt.nResync} 次小缺口对齐（名义 ${money(bt.resyncNtl)}）和 ${bt.nPhantom} 个合成平仓（名义 ${money(bt.phantomNtl)}）。</li>
     <li><b>成交假设：</b>按该地址成交 VWAP ± ${SLIP_BPS}bp 滑点成交，收 ${FEE_BPS}bp taker 费；未模拟跟单延迟与强平。</li>
     <li><b>标记价格：</b>近 200 天用 1h K线，更早用 1d K线 + 成交价兜底（HL 每周期只保留约 5000 根K线）。</li>
-    <li><b>未包含：</b>现货成交 ${D.spotFills} 笔未复制；${D.coinCapped ? `交易市场多达 ${D.coinCapped} 个，仅前 40 大拉取了 K 线/资金费，其余用成交价标记；` : ""}${D.truncated ? "<b>成交历史超过 API 1 万笔上限，最早期已截断；</b>" : ""}官方累计 PnL 曲线为 portfolio 端点原始数据，不受以上近似影响。</li>
+    <li><b>未包含：</b>现货成交 ${D.spotFills} 笔未复制；${D.coinCapped ? `交易市场多达 ${D.coinCapped} 个，仅前 25 大拉取了 K 线/资金费，其余用成交价标记；` : ""}${D.truncated ? "<b>成交历史超过 API 1 万笔上限，最早期已截断；</b>" : ""}官方累计 PnL 曲线为 portfolio 端点原始数据，不受以上近似影响。</li>
   </ul>`;
   for (const id of ["copysec", "tables", "stylesec", "caveats", "leadersec"]) { const el = $(id); if (el) el.classList.remove("hidden"); }
   $("report").classList.remove("hidden");
@@ -845,6 +886,7 @@ async function run(addr) {
   $("progress").classList.remove("hidden");
   $("report").classList.add("hidden");
   $("plog").innerHTML = "";
+  $("progress").scrollIntoView({behavior: "smooth", block: "start"});
   history.replaceState(null, "", "?address=" + addr);
   try {
     const D = await fetchAll(addr);
